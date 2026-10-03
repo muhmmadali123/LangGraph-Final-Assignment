@@ -1,18 +1,12 @@
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import json
 
 from langchain_groq import ChatGroq
 
 from app.config.settings import GROQ_API_KEY, MODEL_NAME
-from app.mcp.calendar_server import (
-    list_upcoming_events,
-    create_calendar_event,
-)
+from app.mcp.calendar_client import call_calendar_tool_sync
 
-
-# ============================================================
-# LLM
-# ============================================================
 
 llm = ChatGroq(
     api_key=GROQ_API_KEY,
@@ -20,78 +14,47 @@ llm = ChatGroq(
     temperature=0,
 )
 
-
-# Pakistan Standard Time
 TIMEZONE = ZoneInfo("Asia/Karachi")
 
 
-# ============================================================
-# MAIN CALENDAR AGENT
-# ============================================================
-
 def ask_calendar_agent(question: str) -> str:
     """
-    Calendar specialist agent.
+    Google Calendar Agent using a real MCP client.
 
-    Supports:
-    - Listing upcoming meetings
-    - Creating/scheduling meetings
-    - Natural language date and time
+    Supported tasks:
+    - Show upcoming meetings
+    - Create meetings
+    - Schedule meetings for specific dates/times
     """
 
     try:
-
-        # ----------------------------------------------------
-        # First determine what the user wants.
-        # ----------------------------------------------------
-
         action = detect_calendar_action(question)
-
-        # ----------------------------------------------------
-        # CREATE MEETING
-        # ----------------------------------------------------
 
         if action == "CREATE":
             return create_meeting_from_question(question)
 
-        # ----------------------------------------------------
-        # LIST MEETINGS
-        # ----------------------------------------------------
-
         if action == "LIST":
             return show_upcoming_meetings()
-
-        # ----------------------------------------------------
-        # UNKNOWN
-        # ----------------------------------------------------
 
         return (
             "I can help you with Google Calendar.\n\n"
             "Examples:\n"
             "• Show my upcoming meetings\n"
             "• Create a meeting today from 5 PM to 6 PM\n"
-            "• Fix my meeting today from 5 PM to 6 PM\n"
-            "• Schedule an AI meeting tomorrow at 4 PM"
+            "• Create an AI meeting tomorrow at 4 PM\n"
+            "• Schedule a meeting tomorrow at 5 PM for 30 minutes"
         )
 
     except Exception as error:
-
         return (
             "Calendar Agent Error:\n"
             f"{error}"
         )
 
 
-# ============================================================
-# DETECT CALENDAR ACTION
-# ============================================================
-
-def detect_calendar_action(
-    question: str,
-) -> str:
+def detect_calendar_action(question: str) -> str:
     """
-    Determine whether the user wants to CREATE
-    or LIST calendar events.
+    Detect whether the user wants to list or create calendar events.
     """
 
     prompt = f"""
@@ -105,8 +68,6 @@ Classify the request into exactly ONE of these:
 CREATE
 LIST
 UNKNOWN
-
-Rules:
 
 CREATE means the user wants to:
 - create a meeting
@@ -129,6 +90,7 @@ LIST means the user wants to:
 - show calendar events
 - list meetings
 - check their calendar
+- see their calendar
 
 Examples:
 "show my upcoming meetings" = LIST
@@ -156,16 +118,19 @@ UNKNOWN
     return "UNKNOWN"
 
 
-# ============================================================
-# SHOW UPCOMING MEETINGS
-# ============================================================
-
 def show_upcoming_meetings() -> str:
     """
-    Get and display upcoming Google Calendar events.
+    Get upcoming meetings through the Calendar MCP server.
     """
 
-    events = list_upcoming_events(10)
+    result = call_calendar_tool_sync(
+        "list_upcoming_events",
+        {
+            "max_results": 10,
+        },
+    )
+
+    events = extract_mcp_json(result)
 
     if not events:
         return (
@@ -173,7 +138,7 @@ def show_upcoming_meetings() -> str:
             "calendar events."
         )
 
-    result = [
+    output = [
         "Your upcoming calendar events:"
     ]
 
@@ -187,15 +152,15 @@ def show_upcoming_meetings() -> str:
             event["end"]
         )
 
-        if (
-            start_display["date"]
-            == end_display["date"]
-        ):
+        if start_display["date"] == end_display["date"]:
+
             time_text = (
                 f"{start_display['time']} - "
                 f"{end_display['time']}"
             )
+
         else:
+
             time_text = (
                 f"{start_display['date']} "
                 f"{start_display['time']} - "
@@ -203,29 +168,24 @@ def show_upcoming_meetings() -> str:
                 f"{end_display['time']}"
             )
 
-        result.append(
-            f"\n• {event['summary']}"
+        output.append(
+            f"\n• {event.get('summary', 'Untitled Event')}"
             f"\n  Date: {start_display['date']}"
             f"\n  Time: {time_text} "
             f"(Pakistan Time)"
             f"\n  Location: "
-            f"{event['location'] or 'Not specified'}"
+            f"{event.get('location') or 'Not specified'}"
         )
 
-    return "\n".join(result)
+    return "\n".join(output)
 
-
-# ============================================================
-# CREATE MEETING FROM NATURAL LANGUAGE
-# ============================================================
 
 def create_meeting_from_question(
     question: str,
 ) -> str:
     """
-    Understand natural-language meeting request,
-    extract date/time information,
-    and create the event.
+    Extract meeting information using the LLM,
+    then create the event through the Calendar MCP server.
     """
 
     now = datetime.now(TIMEZONE)
@@ -266,6 +226,7 @@ Rules:
 5. Example:
    "today from 5 to 6 pm"
    means:
+
    START: {now.strftime("%Y-%m-%d")} 17:00
    END: {now.strftime("%Y-%m-%d")} 18:00
 
@@ -277,6 +238,7 @@ Rules:
 
 8. If no title is provided,
    use:
+
    Meeting
 
 9. Keep the description short.
@@ -286,9 +248,7 @@ Rules:
 11. Return exactly the four required lines.
 """
 
-    response = llm.invoke(
-        extraction_prompt
-    )
+    response = llm.invoke(extraction_prompt)
 
     parsed = parse_meeting_details(
         response.content
@@ -299,17 +259,13 @@ Rules:
             "I could not understand the meeting "
             "details.\n\n"
             "Example:\n"
-            "Fix my meeting today from 5 PM to 6 PM."
+            "Create a meeting today from 5 PM to 6 PM."
         )
 
     title = parsed["title"]
     start = parsed["start"]
     end = parsed["end"]
     description = parsed["description"]
-
-    # --------------------------------------------------------
-    # Convert to datetime
-    # --------------------------------------------------------
 
     try:
 
@@ -333,22 +289,13 @@ Rules:
             "I could not understand the meeting "
             "date or time.\n\n"
             "Example:\n"
-            "Fix my meeting today from 5 PM to 6 PM."
+            "Create a meeting today from 5 PM to 6 PM."
         )
 
-    # --------------------------------------------------------
-    # Make sure end is after start
-    # --------------------------------------------------------
-
+    # If end time is before/equal to start,
+    # use a one-hour duration.
     if end_dt <= start_dt:
-
-        end_dt = start_dt + timedelta(
-            hours=1
-        )
-
-    # --------------------------------------------------------
-    # Prevent past meetings
-    # --------------------------------------------------------
+        end_dt = start_dt + timedelta(hours=1)
 
     current_time = datetime.now(TIMEZONE)
 
@@ -360,20 +307,28 @@ Rules:
             "Please provide a future time."
         )
 
-    # --------------------------------------------------------
-    # Create Google Calendar event
-    # --------------------------------------------------------
-
-    created = create_calendar_event(
-        summary=title,
-        start_time=start_dt.isoformat(),
-        end_time=end_dt.isoformat(),
-        description=description,
+    # Create event through MCP client.
+    result = call_calendar_tool_sync(
+        "create_calendar_event",
+        {
+            "summary": title,
+            "start_time": start_dt.isoformat(),
+            "end_time": end_dt.isoformat(),
+            "description": description,
+        },
     )
 
-    # --------------------------------------------------------
-    # Format response
-    # --------------------------------------------------------
+    created = extract_mcp_json(result)
+
+    # MCP may return the created event as a list.
+    if isinstance(created, list):
+
+        if not created:
+            return (
+                "Calendar MCP created no event."
+            )
+
+        created = created[0]
 
     created_start = format_pakistan_datetime(
         created["start"]
@@ -394,15 +349,90 @@ Rules:
     )
 
 
-# ============================================================
-# PARSE MEETING DETAILS
-# ============================================================
+def extract_mcp_json(result):
+    """
+    Extract JSON data from an MCP tool response.
+
+    Calendar list_upcoming_events can return
+    multiple TextContent JSON objects, while
+    structuredContent can contain the complete list.
+    """
+
+    if getattr(result, "isError", False):
+
+        raise RuntimeError(
+            "Google Calendar MCP tool returned an error."
+        )
+
+    # -------------------------------------------------
+    # First try structuredContent.
+    # -------------------------------------------------
+
+    structured = getattr(
+        result,
+        "structuredContent",
+        None,
+    )
+
+    if structured:
+
+        data = structured.get("result")
+
+        if data is not None:
+            return data
+
+    # -------------------------------------------------
+    # Fallback to text content.
+    # -------------------------------------------------
+
+    if not result.content:
+
+        raise RuntimeError(
+            "Google Calendar MCP tool returned no content."
+        )
+
+    texts = []
+
+    for content in result.content:
+
+        if hasattr(content, "text"):
+
+            text = content.text
+
+            if text:
+                texts.append(text)
+
+    if not texts:
+
+        raise RuntimeError(
+            "Google Calendar MCP tool returned "
+            "no readable content."
+        )
+
+    # -------------------------------------------------
+    # Multiple JSON objects.
+    # -------------------------------------------------
+
+    if len(texts) > 1:
+
+        return [
+            json.loads(text)
+            for text in texts
+        ]
+
+    # -------------------------------------------------
+    # Single JSON object.
+    # -------------------------------------------------
+
+    return json.loads(texts[0])
+
 
 def parse_meeting_details(
     text: str,
 ) -> dict | None:
     """
-    Parse structured LLM output.
+    Parse the four-line response produced by
+    the LLM.
     """
 
     values = {}
@@ -426,6 +456,7 @@ def parse_meeting_details(
             "END",
             "DESCRIPTION",
         }:
+
             values[key] = value
 
     required = [
@@ -451,16 +482,12 @@ def parse_meeting_details(
     }
 
 
-# ============================================================
-# FORMAT PAKISTAN DATETIME
-# ============================================================
-
 def format_pakistan_datetime(
     datetime_string: str,
 ) -> dict:
     """
-    Convert ISO datetime to readable
-    Pakistan date/time.
+    Convert an ISO datetime into readable
+    Pakistan time.
     """
 
     dt = datetime.fromisoformat(

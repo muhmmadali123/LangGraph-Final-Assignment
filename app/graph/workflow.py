@@ -1,3 +1,4 @@
+import re
 from typing import TypedDict
 
 from langgraph.graph import StateGraph, START, END
@@ -14,17 +15,31 @@ class AgentState(TypedDict):
     response: str
 
 
-def supervisor_node(state: AgentState):
+def is_github_repository_request(text: str) -> bool:
     """
-    Route the user's request to the correct specialist agent.
+    Detect GitHub repository requests such as:
+
+    microsoft/vscode
+    facebook/react
+    python/cpython
+    owner/repository
     """
 
+    return bool(
+        re.search(
+            r"\b[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+\b",
+            text,
+        )
+    )
+
+
+def supervisor_node(state: AgentState):
     user_input = state["user_input"]
     text = user_input.lower().strip()
 
-    # ========================================================
-    # RAG AGENT
-    # ========================================================
+    # -------------------------------------------------
+    # RAG Agent
+    # -------------------------------------------------
 
     rag_keywords = [
         "attendance",
@@ -44,9 +59,9 @@ def supervisor_node(state: AgentState):
             "response": ask_rag_agent(user_input)
         }
 
-    # ========================================================
-    # GITHUB AGENT
-    # ========================================================
+    # -------------------------------------------------
+    # GitHub Agent
+    # -------------------------------------------------
 
     github_keywords = [
         "github",
@@ -59,21 +74,29 @@ def supervisor_node(state: AgentState):
         "forks",
     ]
 
-    if any(
-        keyword in text
-        for keyword in github_keywords
+    # Also detect owner/repository format.
+    github_repo_request = (
+        is_github_repository_request(user_input)
+    )
+
+    if (
+        any(
+            keyword in text
+            for keyword in github_keywords
+        )
+        or github_repo_request
     ):
+        # IMPORTANT:
+        # Return the GitHub MCP Agent response
+        # directly without sending it through
+        # another LLM.
         return {
             "response": ask_github_agent(user_input)
         }
 
-    # ========================================================
-    # EMAIL AGENT
-    #
-    # IMPORTANT:
-    # Email is checked before Calendar because an email
-    # request can contain the word "meeting".
-    # ========================================================
+    # -------------------------------------------------
+    # Email Agent
+    # -------------------------------------------------
 
     email_keywords = [
         "email",
@@ -100,9 +123,9 @@ def supervisor_node(state: AgentState):
             "response": ask_email_agent(user_input)
         }
 
-    # ========================================================
-    # CALENDAR AGENT
-    # ========================================================
+    # -------------------------------------------------
+    # Calendar Agent
+    # -------------------------------------------------
 
     calendar_keywords = [
         "calendar",
@@ -139,9 +162,9 @@ def supervisor_node(state: AgentState):
             "response": ask_calendar_agent(user_input)
         }
 
-    # ========================================================
-    # GENERAL SUPERVISOR
-    # ========================================================
+    # -------------------------------------------------
+    # General Supervisor
+    # -------------------------------------------------
 
     return {
         "response": ask_supervisor(user_input)
@@ -149,9 +172,6 @@ def supervisor_node(state: AgentState):
 
 
 def build_graph():
-    """
-    Build and compile the LangGraph workflow.
-    """
 
     graph = StateGraph(AgentState)
 

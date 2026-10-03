@@ -1,12 +1,9 @@
+import json
+
 from langchain_groq import ChatGroq
 
 from app.config.settings import GROQ_API_KEY, MODEL_NAME
-from app.mcp.github_server import (
-    get_github_user,
-    get_repository_info,
-    list_repository_issues,
-    get_repository_readme,
-)
+from app.mcp.github_client import call_github_tool_sync
 
 
 llm = ChatGroq(
@@ -18,7 +15,7 @@ llm = ChatGroq(
 
 def ask_github_agent(question: str) -> str:
     """
-    GitHub specialist agent.
+    GitHub specialist agent using a real MCP client.
 
     Supports:
     - GitHub user/account information
@@ -30,7 +27,6 @@ def ask_github_agent(question: str) -> str:
     question_lower = question.lower()
 
     try:
-
         # ==========================================
         # GITHUB ACCOUNT / USER
         # ==========================================
@@ -44,7 +40,6 @@ def ask_github_agent(question: str) -> str:
                 "github username",
             ]
         ):
-
             username = extract_username(question)
 
             if not username:
@@ -54,7 +49,14 @@ def ask_github_agent(question: str) -> str:
                     "Tell me about the GitHub account microsoft"
                 )
 
-            user = get_github_user(username)
+            result = call_github_tool_sync(
+                "get_github_user",
+                {
+                    "username": username,
+                },
+            )
+
+            user = extract_mcp_json(result)
 
             return format_user_info(user)
 
@@ -78,7 +80,14 @@ def ask_github_agent(question: str) -> str:
 
         if "readme" in question_lower:
 
-            readme = get_repository_readme(repo_name)
+            result = call_github_tool_sync(
+                "get_repository_readme",
+                {
+                    "repo_name": repo_name,
+                },
+            )
+
+            readme = extract_mcp_text(result)
 
             if not readme:
                 return "No readable README was found."
@@ -91,32 +100,43 @@ def ask_github_agent(question: str) -> str:
 
         if "issue" in question_lower:
 
-            issues = list_repository_issues(repo_name)
+            result = call_github_tool_sync(
+                "list_repository_issues",
+                {
+                    "repo_name": repo_name,
+                },
+            )
+
+            issues = extract_mcp_json(result)
 
             if not issues:
-                return (
-                    f"There are no open issues in {repo_name}."
-                )
+                return f"There are no open issues in {repo_name}."
 
-            result = [
+            output = [
                 f"Open issues in {repo_name}:"
             ]
 
             for issue in issues:
-
-                result.append(
+                output.append(
                     f"\n#{issue['number']} - {issue['title']}\n"
                     f"State: {issue['state']}\n"
                     f"URL: {issue['url']}"
                 )
 
-            return "\n".join(result)
+            return "\n".join(output)
 
         # ==========================================
         # REPOSITORY INFORMATION
         # ==========================================
 
-        info = get_repository_info(repo_name)
+        result = call_github_tool_sync(
+            "get_repository_info",
+            {
+                "repo_name": repo_name,
+            },
+        )
+
+        info = extract_mcp_json(result)
 
         return format_repository_info(info)
 
@@ -128,15 +148,61 @@ def ask_github_agent(question: str) -> str:
         )
 
 
+# ==================================================
+# MCP RESULT HELPERS
+# ==================================================
+
+
+def extract_mcp_json(result):
+    """
+    Extract JSON data returned by an MCP tool.
+    """
+
+    if getattr(result, "isError", False):
+        raise RuntimeError(
+            "GitHub MCP tool returned an error."
+        )
+
+    if not result.content:
+        raise RuntimeError(
+            "GitHub MCP tool returned no content."
+        )
+
+    text = result.content[0].text
+
+    return json.loads(text)
+
+
+def extract_mcp_text(result):
+    """
+    Extract plain text returned by an MCP tool.
+    """
+
+    if getattr(result, "isError", False):
+        raise RuntimeError(
+            "GitHub MCP tool returned an error."
+        )
+
+    if not result.content:
+        return ""
+
+    return result.content[0].text
+
+
+# ==================================================
+# REPOSITORY NAME EXTRACTION
+# ==================================================
+
+
 def extract_repo_name(question: str) -> str | None:
     """
     Extract owner/repository from the question.
 
     Example:
-    Tell me about microsoft/vscode
+        Tell me about microsoft/vscode
 
     Returns:
-    microsoft/vscode
+        microsoft/vscode
     """
 
     words = question.split()
@@ -159,10 +225,14 @@ def extract_repo_name(question: str) -> str | None:
         repository = parts[1].strip()
 
         if owner and repository:
-
             return f"{owner}/{repository}"
 
     return None
+
+
+# ==================================================
+# USERNAME EXTRACTION
+# ==================================================
 
 
 def extract_username(question: str) -> str | None:
@@ -170,10 +240,10 @@ def extract_username(question: str) -> str | None:
     Extract a GitHub username from the question.
 
     Example:
-    Tell me about the GitHub account microsoft
+        Tell me about the GitHub account microsoft
 
     Returns:
-    microsoft
+        microsoft
     """
 
     words = question.split()
@@ -220,36 +290,55 @@ def extract_username(question: str) -> str | None:
     return None
 
 
+# ==================================================
+# FORMAT USER INFORMATION
+# ==================================================
+
+
 def format_user_info(user: dict) -> str:
-    """Format GitHub user information."""
 
     return (
-        f"GitHub Username: {user['username']}\n"
-        f"Name: {user['name'] or 'Not provided'}\n"
-        f"Bio: {user['bio'] or 'No bio'}\n"
+        f"GitHub Username: "
+        f"{user.get('username', 'Unknown')}\n"
+        f"Name: "
+        f"{user.get('name') or 'Not provided'}\n"
+        f"Bio: "
+        f"{user.get('bio') or 'No bio'}\n"
         f"Public Repositories: "
-        f"{user['public_repositories']}\n"
-        f"Followers: {user['followers']}\n"
-        f"Following: {user['following']}\n"
+        f"{user.get('public_repositories', 0)}\n"
+        f"Followers: "
+        f"{user.get('followers', 0)}\n"
+        f"Following: "
+        f"{user.get('following', 0)}\n"
         f"Location: "
-        f"{user['location'] or 'Not provided'}\n"
+        f"{user.get('location') or 'Not provided'}\n"
         f"Company: "
-        f"{user['company'] or 'Not provided'}\n"
-        f"Profile: {user['profile_url']}"
+        f"{user.get('company') or 'Not provided'}\n"
+        f"Profile: "
+        f"{user.get('profile_url', 'Not available')}"
     )
 
 
+# ==================================================
+# FORMAT REPOSITORY INFORMATION
+# ==================================================
+
+
 def format_repository_info(info: dict) -> str:
-    """Format GitHub repository information."""
 
     return (
-        f"Repository: {info['name']}\n"
+        f"Repository: "
+        f"{info.get('name', 'Unknown')}\n"
         f"Description: "
-        f"{info['description'] or 'No description'}\n"
-        f"Stars: {info['stars']}\n"
-        f"Forks: {info['forks']}\n"
-        f"Open Issues: {info['open_issues']}\n"
+        f"{info.get('description') or 'No description'}\n"
+        f"Stars: "
+        f"{info.get('stars', 0)}\n"
+        f"Forks: "
+        f"{info.get('forks', 0)}\n"
+        f"Open Issues: "
+        f"{info.get('open_issues', 0)}\n"
         f"Language: "
-        f"{info['language'] or 'Not specified'}\n"
-        f"URL: {info['url']}"
+        f"{info.get('language') or 'Not specified'}\n"
+        f"URL: "
+        f"{info.get('url', 'Not available')}"
     )
